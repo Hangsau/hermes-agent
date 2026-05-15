@@ -30,7 +30,7 @@ hermes update            # runs pip install --upgrade hermes-agent
 Or manually:
 
 ```bash
-pip install --upgrade hermes-agent    # or: uv pip install --upgrade hermes-agent
+uv pip install --upgrade hermes-agent
 ```
 
 :::tip
@@ -217,7 +217,7 @@ The uninstaller gives you the option to keep your configuration files (`~/.herme
 ### pip installs
 
 ```bash
-pip uninstall hermes-agent
+uv pip uninstall hermes-agent
 rm -rf ~/.hermes            # Optional — keep if you plan to reinstall
 ```
 

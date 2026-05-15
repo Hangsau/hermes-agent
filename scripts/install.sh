@@ -1995,6 +1995,9 @@ main() {
     run_setup_wizard
     maybe_start_gateway
 
+    # Stamp install method for detect_install_method()
+    echo "git" > "${HERMES_HOME:=$HOME/.hermes}/.install_method" 2>/dev/null || true
+
     print_success
 }
 

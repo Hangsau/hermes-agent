@@ -195,15 +195,33 @@ def get_managed_update_command() -> Optional[str]:
     if managed_system == "Homebrew":
         return "brew upgrade hermes-agent"
     if managed_system == "NixOS":
-        return "sudo nixos-rebuild switch"
+        return "Update your Nix flake input and rebuild (e.g. nix flake update, nixos-rebuild, or home-manager switch)"
     return None
 
 
 def detect_install_method(project_root: Optional[Path] = None) -> str:
-    """Detect how Hermes was installed: 'nixos', 'homebrew', 'git', or 'pip'."""
+    """Detect how Hermes was installed: 'docker', 'nixos', 'homebrew', 'git', or 'pip'.
+
+    Resolution order:
+    1. Stamped ``~/.hermes/.install_method`` file (written by installers)
+    2. HERMES_MANAGED env / .managed marker (NixOS, Homebrew)
+    3. Docker container detection (/.dockerenv or cgroup)
+    4. .git directory presence → 'git'
+    5. Fallback → 'pip'
+    """
+    stamp = get_hermes_home() / ".install_method"
+    if stamp.is_file():
+        try:
+            method = stamp.read_text().strip().lower()
+            if method:
+                return method
+        except OSError:
+            pass
     managed = get_managed_system()
     if managed:
         return managed.lower().replace(" ", "-")
+    if _is_docker():
+        return "docker"
     if project_root is None:
         project_root = Path(__file__).parent.parent.resolve()
     if (project_root / ".git").is_dir():
@@ -211,12 +229,36 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
     return "pip"
 
 
+def _is_docker() -> bool:
+    """Return True if running inside a Docker/OCI container."""
+    if Path("/.dockerenv").exists():
+        return True
+    try:
+        cgroup = Path("/proc/1/cgroup").read_text()
+        if "docker" in cgroup or "containerd" in cgroup or "kubepods" in cgroup:
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def stamp_install_method(method: str) -> None:
+    """Write the install method to ~/.hermes/.install_method."""
+    stamp = get_hermes_home() / ".install_method"
+    try:
+        stamp.write_text(method + "\n")
+    except OSError:
+        pass
+
+
 def recommended_update_command_for_method(method: str) -> str:
-    """Return the update command for a given install method."""
+    """Return the update command or guidance for a given install method."""
     if method == "nixos":
-        return "sudo nixos-rebuild switch"
+        return "Update your Nix flake input and rebuild (e.g. nix flake update, nixos-rebuild, or home-manager switch)"
     if method == "homebrew":
         return "brew upgrade hermes-agent"
+    if method == "docker":
+        return "docker pull nousresearch/hermes-agent:latest"
     if method == "pip":
         import shutil
         uv = shutil.which("uv")

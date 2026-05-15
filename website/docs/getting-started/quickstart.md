@@ -51,7 +51,7 @@ Pick the row that matches your goal:
 **Option A — pip (simplest):**
 
 ```bash
-pip install hermes-agent
+uv pip install hermes-agent
 hermes postinstall     # optional: installs Node.js, browser, ripgrep, ffmpeg + runs setup
 ```
 

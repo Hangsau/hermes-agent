@@ -13,7 +13,7 @@ Get Hermes Agent up and running in under two minutes with the one-line installer
 ### pip (recommended for most users)
 
 ```bash
-pip install hermes-agent
+uv pip install hermes-agent
 ```
 
 This gives you the full Hermes Agent — CLI, web dashboard, and TUI — with zero external dependencies for core usage. Node.js, browser engines, and other optional tools are bootstrapped lazily on first use (e.g. when you run `hermes --tui` or use browser tools).
@@ -32,7 +32,7 @@ hermes         # start chatting
 :::
 
 :::tip
-If you have [uv](https://docs.astral.sh/uv/) installed, `uv pip install hermes-agent` is faster.
+Don't have [uv](https://docs.astral.sh/uv/) yet? Install it with `curl -LsSf https://astral.sh/uv/install.sh | sh`, or use `pip install hermes-agent` instead.
 :::
 
 ### One-Line Installer (Linux / macOS / WSL2)
@@ -107,7 +107,7 @@ Where the installer puts things depends on whether you're installing as a normal
 
 | Installer | Code lives at | `hermes` binary | Data directory |
 |---|---|---|---|
-| pip install | Python site-packages | `~/.local/bin/hermes` (console_scripts) | `~/.hermes/` |
+| uv pip install | Python site-packages | `~/.local/bin/hermes` (console_scripts) | `~/.hermes/` |
 | Per-user (git installer) | `~/.hermes/hermes-agent/` | `~/.local/bin/hermes` (symlink) | `~/.hermes/` |
 | Root-mode (`sudo curl … \| sudo bash`) | `/usr/local/lib/hermes-agent/` | `/usr/local/bin/hermes` | `/root/.hermes/` (or `$HERMES_HOME`) |
 
@@ -136,7 +136,7 @@ hermes setup          # Or run the full setup wizard to configure everything at 
 
 ## Prerequisites
 
-**pip install:** No prerequisites beyond Python 3.11+. Everything else is handled automatically.
+**uv pip install:** No prerequisites beyond Python 3.11+ and [uv](https://docs.astral.sh/uv/). Everything else is handled automatically.
 
 **Git installer:** The only prerequisite is **Git**. The installer automatically handles everything else:
 
