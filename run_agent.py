@@ -1946,6 +1946,7 @@ class AIAgent:
         
         # Cached system prompt -- built once per session, only rebuilt on compression
         self._cached_system_prompt: Optional[str] = None
+        self._session_timestamp: Optional[str] = None  # WS-013: lazy-built, injected into first user msg
         
         # Filesystem checkpoint manager (transparent — not a tool)
         from tools.checkpoint_manager import CheckpointManager
@@ -6253,13 +6254,38 @@ class AIAgent:
             timestamp_line += f"\nModel: {self.model}"
         if self.provider:
             timestamp_line += f"\nProvider: {self.provider}"
-        volatile_parts.append(timestamp_line)
+        # WS-013: timestamp is no longer appended to volatile_parts.
+        # Use self._get_session_timestamp() instead — keeps system prompt byte-stable.
 
         return {
             "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
             "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
             "volatile": "\n\n".join(p.strip() for p in volatile_parts if p and p.strip()),
         }
+
+    def _get_session_timestamp(self) -> Optional[str]:
+        """Lazy-build the session timestamp string.
+
+        Built once per AIAgent instance, then cached.  Returns None if
+        essential fields (model/provider) aren't set yet.
+
+        WS-013: Extracted from _build_system_prompt_parts so it can be
+        called before user_msg construction in run_conversation, keeping
+        the system prompt (which is built later) byte-stable.
+        """
+        if self._session_timestamp is not None:
+            return self._session_timestamp
+        from hermes_time import now as _hermes_now
+        now = _hermes_now()
+        ts = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
+        if self.pass_session_id and self.session_id:
+            ts += f"\nSession ID: {self.session_id}"
+        if self.model:
+            ts += f"\nModel: {self.model}"
+        if self.provider:
+            ts += f"\nProvider: {self.provider}"
+        self._session_timestamp = ts
+        return ts
 
     def _build_system_prompt(self, system_message: str = None) -> str:
         """
@@ -12300,8 +12326,10 @@ class AIAgent:
                 _should_review_memory = True
                 self._turns_since_memory = 0
 
-        # Add user message
-        user_msg = {"role": "user", "content": user_message}
+        # Add user message — prepend session timestamp on new sessions (WS-013)
+        _ts = self._get_session_timestamp()
+        _content = f"{_ts}\n\n{user_message}" if (not conversation_history and _ts) else (user_message or "")
+        user_msg = {"role": "user", "content": _content}
         messages.append(user_msg)
         current_turn_user_idx = len(messages) - 1
         self._persist_user_message_idx = current_turn_user_idx

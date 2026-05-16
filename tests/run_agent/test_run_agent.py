@@ -985,9 +985,87 @@ class TestBuildSystemPrompt:
         assert MEMORY_GUIDANCE not in prompt
 
     def test_includes_datetime(self, agent):
+        """Timestamp should NOT be in system prompt; should be available via _get_session_timestamp()."""
         prompt = agent._build_system_prompt()
-        # Should contain current date info like "Conversation started:"
-        assert "Conversation started:" in prompt
+        assert "Conversation started:" not in prompt, \
+            "Timestamp should not be in system prompt"
+        ts = agent._get_session_timestamp()
+        assert ts is not None, "Agent should return a valid timestamp"
+        assert "Conversation started:" in ts
+
+    def test_system_prompt_stable_across_sessions(self):
+        """Two agents with same config produce byte-identical system prompts."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a1 = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            a2 = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            p1 = a1._build_system_prompt()
+            p2 = a2._build_system_prompt()
+            assert p1 == p2, f"System prompts differ!\n=== P1 ===\n{p1}\n=== P2 ===\n{p2}"
+
+    def test_no_duplicate_timestamp_on_resume(self, agent):
+        """Session with conversation_history should NOT inject timestamp into user message."""
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.tool_delay = 0
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        resp = _mock_response(content="ok", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            history = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}]
+            result = agent.run_conversation(
+                user_message="继续",
+                conversation_history=history,
+            )
+        msgs = result.get("messages", [])
+        first_user = next((m for m in msgs if m["role"] == "user"), None)
+        assert first_user is not None
+        assert "Conversation started:" not in first_user["content"], \
+            f"Timestamp should not be in resumed session user message: {first_user['content'][:200]}"
+
+    def test_timestamp_injected_on_new_session(self, agent):
+        """Fresh session (no conversation_history) should inject timestamp into user message."""
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.tool_delay = 0
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        resp = _mock_response(content="ok", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                user_message="hello",
+                conversation_history=None,
+            )
+        msgs = result.get("messages", [])
+        first_user = next((m for m in msgs if m["role"] == "user"), None)
+        assert first_user is not None
+        assert "Conversation started:" in first_user["content"], \
+            f"Timestamp should be in new session user message: {first_user['content'][:200]}"
 
     def test_includes_nous_subscription_prompt(self, agent, monkeypatch):
         monkeypatch.setattr(run_agent, "build_nous_subscription_prompt", lambda tool_names: "NOUS SUBSCRIPTION BLOCK")

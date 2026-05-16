@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import shlex
+import subprocess
 import sys
 import signal
 import tempfile
@@ -364,6 +365,48 @@ def _home_thread_env_var(platform_name: str) -> str:
 def _restart_notification_pending() -> bool:
     """Return True when a /restart completion marker is waiting to be delivered."""
     return (_hermes_home / ".restart_notify.json").exists()
+
+
+def _read_workspace_context() -> Optional[str]:
+    """Read workspace state for new-session context injection.
+
+    Returns a compact markdown block combining:
+    - session_state.md (active project, blockers, next action)
+    - workspace_inject.py --brief (active project overview)
+
+    Returns None when neither source is available, so callers can
+    silently skip injection without breaking session startup.
+    """
+    ws_dir = Path.home() / ".hermes" / "workspace"
+    parts: list[str] = []
+
+    # Layer 1 — session_state.md: what we were doing, blockers, next action
+    state_file = ws_dir / "session_state.md"
+    if state_file.exists():
+        try:
+            content = state_file.read_text().strip()
+            if content:
+                parts.append(content)
+        except Exception:
+            pass
+
+    # Layer 2 — workspace_inject.py --brief: active project overview
+    inject_script = Path.home() / ".hermes" / "scripts" / "workspace_inject.py"
+    if inject_script.exists():
+        try:
+            result = subprocess.run(
+                [sys.executable, str(inject_script), "--brief"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                parts.append(result.stdout.strip())
+        except Exception:
+            pass
+
+    if not parts:
+        return None
+
+    return "\n\n".join(parts)
 
 
 # Mark this process as a gateway so cli.py's module-level load_cli_config()
@@ -7297,6 +7340,11 @@ class GatewayRunner:
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        # WS-005 Phase 1: inject workspace context on new sessions
+        if _is_new_session:
+            ws_ctx = _read_workspace_context()
+            if ws_ctx:
+                context_prompt += "\n\n---\nWORKSPACE CONTEXT (from ~/.hermes/workspace/)\n---\n\n" + ws_ctx
         
         # WS-005 Phase 1: inject workspace context on new sessions
         if _is_new_session:

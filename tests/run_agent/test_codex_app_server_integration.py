@@ -92,7 +92,7 @@ class TestRunConversationCodexPath:
         # User message + 3 projected (assistant tool_call + tool + assistant text)
         assert len(msgs) >= 4
         assert msgs[0]["role"] == "user"
-        assert msgs[0]["content"] == "hello"
+        assert "hello" in msgs[0]["content"]
         # Last assistant message has the final text
         final = [m for m in msgs if m.get("role") == "assistant"
                  and m.get("content") == "echo: hello"]
@@ -126,7 +126,7 @@ class TestRunConversationCodexPath:
             result = agent.run_conversation("ping unique 12345")
         user_count = sum(
             1 for m in result["messages"]
-            if m.get("role") == "user" and m.get("content") == "ping unique 12345"
+            if m.get("role") == "user" and "ping unique 12345" in m.get("content", "")
         )
         assert user_count == 1, f"user message appeared {user_count}× in {result['messages']}"
 
