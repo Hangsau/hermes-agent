@@ -860,6 +860,33 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     prompt = str(job.get("prompt") or "")
     skills = job.get("skills")
 
+    # Guard: detect self-restart / self-stop commands in the prompt.
+    # When a cron job runs ``systemctl restart hermes-gateway`` or similar,
+    # the gateway process is killed before the job can be marked complete,
+    # creating an infinite restart loop on every subsequent gateway start.
+    # Block these commands at the scheduler level — a gateway restart
+    # initiated from a cron job can never clean up after itself.
+    _self_restart_denylist = [
+        "systemctl restart hermes-gateway",
+        "systemctl stop hermes-gateway",
+        "hermes gateway restart",
+        "hermes gateway stop",
+        "systemctl kill hermes-gateway",
+    ]
+    _prompt_lower = prompt.lower()
+    for _pattern in _self_restart_denylist:
+        if _pattern.lower() in _prompt_lower:
+            _msg = (
+                f"Job '{job_name}' contains a self-restart/self-stop command "
+                f"({_pattern!r}).  Cron jobs that kill the gateway cannot "
+                f"complete — the job is orphaned and re-queued on every "
+                f"startup, creating an infinite restart loop.  "
+                f"Use ``{_pattern}`` from outside the gateway "
+                f"(e.g. manually in a terminal)."
+            )
+            logger.error(_msg)
+            return False, _msg, "", None
+
     # Run data-collection script if configured, inject output as context.
     script_path = job.get("script")
     if script_path:

@@ -999,7 +999,14 @@ class SessionStore:
 
         Returns True if the session existed and was marked.
         """
-        with self._lock:
+        if not self._lock.acquire(timeout=2.0):
+            logger.warning(
+                "mark_resume_pending: could not acquire session lock within 2s "
+                "for %s (reason=%s) — skipping to avoid event-loop deadlock",
+                session_key, reason,
+            )
+            return False
+        try:
             self._ensure_loaded_locked()
             if session_key in self._entries:
                 entry = self._entries[session_key]
@@ -1012,6 +1019,8 @@ class SessionStore:
                 entry.last_resume_marked_at = _now()
                 self._save()
                 return True
+        finally:
+            self._lock.release()
         return False
 
     def clear_resume_pending(self, session_key: str) -> bool:

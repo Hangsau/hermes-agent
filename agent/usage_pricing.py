@@ -362,6 +362,26 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     ),
     (
         "deepseek",
+        "deepseek-v4-pro",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.14"),
+        output_cost_per_million=Decimal("0.28"),
+        source="official_docs_snapshot",
+        source_url="https://api-docs.deepseek.com/quick_start/pricing",
+        pricing_version="deepseek-promo-expires-2026-05",
+    ),
+    (
+        "deepseek",
+        "deepseek-v4-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.14"),
+        output_cost_per_million=Decimal("0.28"),
+        source="official_docs_snapshot",
+        source_url="https://api-docs.deepseek.com/quick_start/pricing",
+        pricing_version="deepseek-promo-expires-2026-05",
+    ),
+    (
+        "deepseek",
         "deepseek-reasoner",
     ): PricingEntry(
         input_cost_per_million=Decimal("0.55"),

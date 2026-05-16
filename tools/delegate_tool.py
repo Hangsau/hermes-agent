@@ -386,6 +386,31 @@ def _get_child_timeout() -> float:
     return float(DEFAULT_CHILD_TIMEOUT)
 
 
+DEFAULT_MAX_SUMMARY_CHARS = 4000  # 0 = no cap
+
+
+def _get_max_summary_chars() -> int:
+    """Read delegation.max_summary_chars from config.
+
+    Returns the max number of characters allowed in a subagent summary.
+    Default 4000; 0 disables truncation. Negative values clamped to 0.
+    """
+    cfg = _load_config()
+    val = cfg.get("max_summary_chars")
+    if val is not None:
+        try:
+            ival = int(val)
+            return max(0, ival)
+        except (TypeError, ValueError):
+            logger.warning(
+                "delegation.max_summary_chars=%r is not a valid int; "
+                "using default %d",
+                val,
+                DEFAULT_MAX_SUMMARY_CHARS,
+            )
+    return DEFAULT_MAX_SUMMARY_CHARS
+
+
 def _get_max_spawn_depth() -> int:
     """Read delegation.max_spawn_depth from config, clamped to [1, 3].
 
@@ -589,19 +614,24 @@ def _build_child_system_prompt(
         parts.append(
             "\nWORKSPACE PATH:\n"
             f"{workspace_path}\n"
-            "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
+            "Use this exact path for local repository/workdir operations. "
+            "Never assume /workspace/ or other container paths — "
+            "discover paths first if not explicitly given."
         )
     parts.append(
-        "\nComplete this task using the tools available to you. "
-        "When finished, provide a clear, concise summary of:\n"
-        "- What you did\n"
-        "- What you found or accomplished\n"
-        "- Any files you created or modified\n"
-        "- Any issues encountered\n\n"
-        "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
-        "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
-        "Be thorough but concise -- your response is returned to the "
-        "parent agent as a summary."
+        "\n## COMPLETION\n"
+        "Return a structured summary (800–1500 tokens; raw tool output is discarded).\n"
+        "1. Key findings (2-4 bullets)\n"
+        "2. What you did / changed\n"
+        "3. Issues encountered\n\n"
+        "## VERIFICATION (do before reporting)\n"
+        "- If you modified files, re-read them to confirm the edits.\n"
+        "- If a test command exists, run it. Report failures truthfully.\n"
+        "- If the result doesn't match expectations, state that explicitly.\n\n"
+        "## FAILURE RULE\n"
+        "You are a replaceable execution unit. If you hit an unsolvable "
+        "problem, report what you tried and why it failed — do not loop. "
+        "The parent agent will decide next steps."
     )
     if role == "orchestrator":
         child_note = (
@@ -1613,6 +1643,18 @@ def _run_single_child(
         duration = round(time.monotonic() - child_start, 2)
 
         summary = result.get("final_response") or ""
+
+        # Hard cap on subagent summary to prevent parent context overflow.
+        # Port of Hermes #9126 pattern — configurable, 0 = disabled.
+        max_chars = _get_max_summary_chars()
+        if max_chars > 0 and len(summary) > max_chars:
+            summary = summary[:max_chars] + "\n[...truncated]"
+            logger.debug(
+                "Subagent summary truncated: %d → %d chars",
+                len(result.get("final_response") or ""),
+                len(summary),
+            )
+
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
@@ -2681,9 +2723,11 @@ DELEGATE_TASK_SCHEMA = {
             "context": {
                 "type": "string",
                 "description": (
-                    "Background information the subagent needs: file paths, "
-                    "error messages, project structure, constraints. The more "
-                    "specific you are, the better the subagent performs."
+                    "Background information the subagent needs. "
+                    "Prefer dense key:value format (e.g. 'Path: /x\\n"
+                    "Constraint: no new deps\\nTest: pytest'). "
+                    "Avoid narrative prose — every token competes "
+                    "for the subagent's limited attention budget."
                 ),
             },
             "toolsets": {

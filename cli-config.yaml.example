@@ -1089,3 +1089,21 @@ display:
 #     - command: "~/.hermes/agent-hooks/log-orchestration.sh"
 #
 # hooks_auto_accept: false
+
+# =============================================================================
+# Heartbeat 2.0 (Autonomic + Cognitive Layer)
+# =============================================================================
+# The heartbeat system senses gateway state and makes autonomous decisions
+# when the gateway is idle. All actions are safe — they only write to files
+# and never mutate gateway state directly.
+#
+heartbeat:
+  # Autonomic layer: short-interval sensing and recording
+  autonomic_interval_seconds: 30      # How often to sample gateway state
+  stuck_threshold_minutes: 30         # Mark agents stuck after N minutes
+  stuck_recovery_minutes: 45          # Auto-interrupt stuck agents after N minutes
+
+  # Cognitive layer: idle-time decision making
+  cognitive_enabled: true             # Enable idle-time autonomous actions
+  cognitive_interval_seconds: 300     # How often to run cognitive cycle (5 min)
+  cognitive_action_timeout_seconds: 300  # Max seconds per cognitive action

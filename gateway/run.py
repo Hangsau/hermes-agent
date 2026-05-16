@@ -1170,7 +1170,46 @@ def _preserve_queued_followup_history_offset(
     merged = dict(followup_result)
     merged["history_offset"] = current_offset
     return merged
+def _read_workspace_context() -> Optional[str]:
+    """Read workspace state for new-session context injection.
 
+    Returns a compact markdown block combining:
+    - session_state.md (active project, blockers, next action)
+    - workspace_inject.py --brief (active project overview)
+
+    Returns None when neither source is available, so callers can
+    silently skip injection without breaking session startup.
+    """
+    ws_dir = Path.home() / ".hermes" / "workspace"
+    parts: list[str] = []
+
+    # Layer 1 — session_state.md: what we were doing, blockers, next action
+    state_file = ws_dir / "session_state.md"
+    if state_file.exists():
+        try:
+            content = state_file.read_text().strip()
+            if content:
+                parts.append(content)
+        except Exception:
+            pass
+
+    # Layer 2 — workspace_inject.py --brief: active project overview
+    inject_script = Path.home() / ".hermes" / "scripts" / "workspace_inject.py"
+    if inject_script.exists():
+        try:
+            result = subprocess.run(
+                [sys.executable, str(inject_script), "--brief"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                parts.append(result.stdout.strip())
+        except Exception:
+            pass
+
+    if not parts:
+        return None
+
+    return "\n\n".join(parts)
 
 class GatewayRunner:
     """
@@ -1386,6 +1425,9 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+
+        # Heartbeat V2 health coordinator (initialised in run())
+        self._heartbeat_v2 = None
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -3200,8 +3242,16 @@ class GatewayRunner:
                 start_new_session=True,
             )
 
-    def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+    def request_restart(self, *, detached: bool = False, via_service: bool = False, force: bool = False) -> bool:
         if self._restart_task_started:
+            return False
+        active_count = self._running_agent_count()
+        if active_count > 0 and not force:
+            logger.warning(
+                "Refusing restart request: %d active agent(s) still running. "
+                "Use force=True or restart externally (systemctl/SSH).",
+                active_count,
+            )
             return False
         self._restart_requested = True
         self._restart_detached = detached
@@ -3520,6 +3570,23 @@ class GatewayRunner:
         # This prevents unwanted auto-resets after `hermes update`,
         # `hermes gateway restart`, or `/restart`.
         _clean_marker = _hermes_home / ".clean_shutdown"
+        
+        # Gateway shutdown post-mortem: detect dirty shutdowns from previous run.
+        # Must run BEFORE the marker is consumed (unlink'd) below — we check
+        # the flag's existence to decide whether the last shutdown was clean.
+        if not _clean_marker.exists():
+            try:
+                import sys
+                scripts_dir = str(_hermes_home / "scripts")
+                if scripts_dir not in sys.path:
+                    sys.path.insert(0, scripts_dir)
+                from gateway_shutdown_analyzer import analyze_and_report
+                report_path = analyze_and_report(_hermes_home)
+                if report_path:
+                    logger.info("Shutdown post-mortem generated: %s", report_path)
+            except Exception as e:
+                logger.debug("Shutdown post-mortem skipped: %s", e)
+        
         if _clean_marker.exists():
             logger.info("Previous gateway exited cleanly — skipping session suspension")
             try:
@@ -3826,6 +3893,19 @@ class GatewayRunner:
         # destination platform's home channel, then forges a synthetic user
         # turn so the agent kicks off the new chat.
         asyncio.create_task(self._handoff_watcher())
+        # Start Heartbeat V2 health coordinator
+        try:
+            from gateway.heartbeat_v2 import HeartbeatV2, build_heartbeat_snapshot
+            self._heartbeat_v2 = HeartbeatV2(
+                snapshot_fn=lambda: build_heartbeat_snapshot(self),
+                config=self.config,
+                cost_summary_fn=lambda: self._session_db.get_cost_summary(since_hours=24) if hasattr(self, '_session_db') and self._session_db else None,
+            )
+            asyncio.create_task(self._heartbeat_v2.loop())
+            logger.info("Heartbeat V2 health coordinator started")
+        except Exception as e:
+            logger.warning("Failed to start Heartbeat V2: %s", e)
+            self._heartbeat_v2 = None
 
         logger.info("Press Ctrl+C to stop")
         
@@ -5015,6 +5095,13 @@ class GatewayRunner:
             self._running = False
             self._draining = True
 
+            # Stop Heartbeat V2 cleanly
+            if self._heartbeat_v2 is not None:
+                try:
+                    self._heartbeat_v2.stop()
+                except Exception as _e:
+                    logger.debug("Heartbeat V2 stop error: %s", _e)
+
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
             await self._notify_active_sessions_of_shutdown()
@@ -5058,12 +5145,17 @@ class GatewayRunner:
                 # the drain window, and marking those falsely would give
                 # them a stray restart-interruption system note on their
                 # next turn even though their previous turn completed
-                # cleanly.  Skip pending sentinels for the same reason
+                # skip pending sentinels for the same reason
                 # _interrupt_running_agents() does: their agent hasn't
                 # started yet, there's nothing to interrupt, and the
                 # session shouldn't carry a misleading resume flag.
+                _agent_keys = [_sk for _sk, _a in list(self._running_agents.items()) if _a is not _AGENT_PENDING_SENTINEL]
                 _resume_reason = (
                     "restart_timeout" if self._restart_requested else "shutdown_timeout"
+                )
+                logger.info(
+                    "Shutdown phase: marking %d active agent(s) resume_pending (%s)",
+                    len(_agent_keys), _resume_reason,
                 )
                 for _sk, _agent in list(self._running_agents.items()):
                     if _agent is _AGENT_PENDING_SENTINEL:
@@ -5075,13 +5167,16 @@ class GatewayRunner:
                             "mark_resume_pending failed for %s: %s",
                             _sk, _e,
                         )
+                logger.info("Shutdown phase: resume_pending marking complete")
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
+                logger.info("Shutdown phase: interrupt_running_agents complete")
                 interrupt_deadline = asyncio.get_running_loop().time() + 5.0
                 while self._running_agents and asyncio.get_running_loop().time() < interrupt_deadline:
                     self._update_runtime_status("draining")
                     await asyncio.sleep(0.1)
+                logger.info("Shutdown phase: post-interrupt wait complete (agents still running: %d)", len(self._running_agents))
 
                 # Kill lingering tool subprocesses NOW, before we spend more
                 # budget on adapter disconnect / session DB close.  Under
@@ -7203,6 +7298,12 @@ class GatewayRunner:
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
         
+        # WS-005 Phase 1: inject workspace context on new sessions
+        if _is_new_session:
+            ws_ctx = _read_workspace_context()
+            if ws_ctx:
+                context_prompt += "\n\n---\nWORKSPACE CONTEXT (from ~/.hermes/workspace/)\n---\n\n" + ws_ctx
+
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if getattr(session_entry, 'was_auto_reset', False):
@@ -7661,6 +7762,18 @@ class GatewayRunner:
                 vc_context = adapter.get_voice_channel_context(guild_id)
                 if vc_context:
                     context_prompt += f"\n\n{vc_context}"
+
+        # -----------------------------------------------------------------
+        # Workspace continuity: inject previous session state into
+        # the system prompt so the agent knows what was being worked
+        # on across restart boundaries without searching (WS-005 Phase 1).
+        # -----------------------------------------------------------------
+        try:
+            _ws_state_path = Path.home() / ".hermes" / "workspace" / "session_state.md"
+            if _ws_state_path.exists():
+                context_prompt += "\n\n" + _ws_state_path.read_text().strip()
+        except Exception:
+            pass
 
         # -----------------------------------------------------------------
         # Auto-analyze images sent by the user
@@ -8953,6 +9066,14 @@ class GatewayRunner:
             logger.debug("Failed to write restart dedup marker: %s", e)
 
         active_agents = self._running_agent_count()
+        if active_agents > 0:
+            logger.warning(
+                "Refusing /restart: %d active agent(s) still running. "
+                "Use systemctl restart externally.",
+                active_agents,
+            )
+            return f"⚠️ Cannot restart: {active_agents} active agent(s) still running.\nPlease restart externally: `systemctl restart hermes-gateway`"
+
         # When running under a service manager (systemd/launchd), use the
         # service restart path: exit with code 75 so the service manager
         # restarts us.  The detached subprocess approach (setsid + bash)
@@ -16569,10 +16690,11 @@ class GatewayRunner:
         return response
 
 
-def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60,
+                       backpressure_check=None):
     """
     Background thread that ticks the cron scheduler at a regular interval.
-    
+    ...
     Runs inside the gateway process so cronjobs fire automatically without
     needing a separate `hermes cron daemon` or system cron entry.
 
@@ -16595,6 +16717,17 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     logger.info("Cron ticker started (interval=%ds)", interval)
     tick_count = 0
     while not stop_event.is_set():
+        # Backpressure gate: skip cron ticks when gateway is under heavy load
+        if backpressure_check is not None:
+            try:
+                if backpressure_check():
+                    logger.debug("Cron tick %d skipped due to backpressure", tick_count)
+                    tick_count += 1
+                    time.sleep(interval)
+                    continue
+            except Exception as e:
+                logger.debug("Backpressure check error: %s", e)
+
         try:
             cron_tick(verbose=False, adapters=adapters, loop=loop)
         except Exception as e:
@@ -16915,7 +17048,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         asyncio.create_task(runner.stop())
 
     def restart_signal_handler():
-        runner.request_restart(detached=False, via_service=True)
+        runner.request_restart(detached=False, via_service=True, force=True)
     
     loop = asyncio.get_running_loop()
     if threading.current_thread() is threading.main_thread():
@@ -16991,7 +17124,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     cron_thread = threading.Thread(
         target=_start_cron_ticker,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={
+            "adapters": runner.adapters,
+            "loop": asyncio.get_running_loop(),
+            "backpressure_check": lambda: (
+                runner._heartbeat_v2.is_under_backpressure()
+                if getattr(runner, "_heartbeat_v2", None) is not None
+                else False
+            ),
+        },
         daemon=True,
         name="cron-ticker",
     )

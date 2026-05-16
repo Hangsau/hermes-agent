@@ -831,6 +831,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                # Clear one-shot dispatch guard — job completed, no longer an orphan
+                job.pop("attempted_at", None)
                 
                 # Increment completed count
                 if job.get("repeat"):
@@ -891,9 +893,16 @@ def advance_next_run(job_id: str) -> bool:
     scheduler from at-least-once to at-most-once for recurring jobs — missing
     one run is far better than firing dozens of times in a crash loop.
 
-    One-shot jobs are left unchanged so they can still retry on restart.
+    One-shot jobs get an ``attempted_at`` timestamp so the scheduler knows
+    the job was already dispatched.  Without this, a one-shot that kills the
+    gateway (e.g. ``systemctl restart hermes-gateway``) will be re-queued
+    forever because ``mark_job_run`` never gets to set ``last_run_at``.
 
-    Returns True if next_run_at was advanced, False otherwise.
+    ``attempted_at`` is set under the same file lock that guards
+    ``next_run_at`` advancement — it is visible to the next gateway process
+    before the current one exits (atomic write).
+
+    Returns True if next_run_at was advanced (or attempted_at set), False otherwise.
     """
     with _jobs_file_lock:
         jobs = load_jobs()
@@ -901,259 +910,10 @@ def advance_next_run(job_id: str) -> bool:
             if job["id"] == job_id:
                 kind = job.get("schedule", {}).get("kind")
                 if kind not in {"cron", "interval"}:
-                    return False
-                now = _hermes_now().isoformat()
-                new_next = compute_next_run(job["schedule"], now)
-                if new_next and new_next != job.get("next_run_at"):
-                    job["next_run_at"] = new_next
-                    save_jobs(jobs)
-                    return True
-                return False
-        return False
-
-
-def get_due_jobs() -> List[Dict[str, Any]]:
-    """Get all jobs that are due to run now.
-
-    For recurring jobs (cron/interval), if the scheduled time is stale
-    (more than one period in the past, e.g. because the gateway was down),
-    the job is fast-forwarded to the next future run instead of firing
-    immediately.  This prevents a burst of missed jobs on gateway restart.
-    """
-    with _jobs_file_lock:
-        return _get_due_jobs_locked()
-
-
-def _get_due_jobs_locked() -> List[Dict[str, Any]]:
-    """Inner implementation of get_due_jobs(); must be called with _jobs_file_lock held."""
-    now = _hermes_now()
-    raw_jobs = load_jobs()
-    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
-    due = []
-    needs_save = False
-
-    for job in jobs:
-        if not job.get("enabled", True):
-            continue
-
-        next_run = job.get("next_run_at")
-        if not next_run:
-            schedule = job.get("schedule", {})
-            kind = schedule.get("kind")
-
-            # One-shot jobs use a small grace window via the dedicated helper.
-            recovered_next = _recoverable_oneshot_run_at(
-                schedule,
-                now,
-                last_run_at=job.get("last_run_at"),
-            )
-            recovery_kind = "one-shot" if recovered_next else None
-
-            # Recurring jobs reach here only when something — typically a
-            # direct jobs.json edit that bypassed add_job() — left
-            # next_run_at unset.  Without this branch, such jobs are
-            # silently skipped forever; recompute next_run_at from the
-            # schedule so they pick up at their next scheduled tick.
-            if not recovered_next and kind in {"cron", "interval"}:
-                recovered_next = compute_next_run(schedule, now.isoformat())
-                if recovered_next:
-                    recovery_kind = kind
-
-            if not recovered_next:
-                continue
-
-            job["next_run_at"] = recovered_next
-            next_run = recovered_next
-            logger.info(
-                "Job '%s' had no next_run_at; recovering %s run at %s",
-                job.get("name", job["id"]),
-                recovery_kind,
-                recovered_next,
-            )
-            for rj in raw_jobs:
-                if rj["id"] == job["id"]:
-                    rj["next_run_at"] = recovered_next
-                    needs_save = True
-                    break
-
-        next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
-        if next_run_dt <= now:
-            schedule = job.get("schedule", {})
-            kind = schedule.get("kind")
-
-            # For recurring jobs, check if the scheduled time is stale
-            # (gateway was down and missed the window). Fast-forward to
-            # the next future occurrence instead of firing a stale run.
-            grace = _compute_grace_seconds(schedule)
-            if kind in {"cron", "interval"} and (now - next_run_dt).total_seconds() > grace:
-                # Job is past its catch-up grace window — this is a stale missed run.
-                # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
-                new_next = compute_next_run(schedule, now.isoformat())
-                if new_next:
-                    logger.info(
-                        "Job '%s' missed its scheduled time (%s, grace=%ds). "
-                        "Fast-forwarding to next run: %s",
-                        job.get("name", job["id"]),
-                        next_run,
-                        grace,
-                        new_next,
-                    )
-                    # Update the job in storage
-                    for rj in raw_jobs:
-                        if rj["id"] == job["id"]:
-                            rj["next_run_at"] = new_next
-                            needs_save = True
-                            break
-                    continue  # Skip this run
-
-            due.append(job)
-
-    if needs_save:
-        save_jobs(raw_jobs)
-
-    return due
-
-
-def save_job_output(job_id: str, output: str):
-    """Save job output to file."""
-    ensure_dirs()
-    job_output_dir = OUTPUT_DIR / job_id
-    job_output_dir.mkdir(parents=True, exist_ok=True)
-    _secure_dir(job_output_dir)
-    
-    timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_file = job_output_dir / f"{timestamp}.md"
-    
-    fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(output)
-            f.flush()
-            os.fsync(f.fileno())
-        atomic_replace(tmp_path, output_file)
-        _secure_file(output_file)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    
-    return output_file
-
-
-# =============================================================================
-# Skill reference rewriting (curator integration)
-# =============================================================================
-
-def rewrite_skill_refs(
-    consolidated: Optional[Dict[str, str]] = None,
-    pruned: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    """Rewrite cron job skill references after a curator consolidation pass.
-
-    When the curator consolidates a skill X into umbrella Y (or archives X
-    as pruned), any cron job that lists ``X`` in its ``skills`` field will
-    fail to load ``X`` at run time — the scheduler logs a warning and
-    skips the skill, so the job runs without the instructions it was
-    scheduled to follow. See cron/scheduler.py where ``skill_view`` is
-    called per skill name.
-
-    This function repairs cron jobs in-place:
-
-    - A skill listed in ``consolidated`` is replaced with its umbrella
-      target (the ``into`` value). If the umbrella is already in the
-      job's skill list, the stale name is dropped without duplication.
-    - A skill listed in ``pruned`` is dropped outright — there is no
-      forwarding target.
-    - Ordering and other skills in the list are preserved.
-    - The legacy ``skill`` field is realigned via ``_apply_skill_fields``.
-
-    Args:
-        consolidated: mapping of ``old_skill_name -> umbrella_skill_name``.
-        pruned: list of skill names that were archived with no forwarding
-            target.
-
-    Returns a report dict::
-
-        {
-            "rewrites": [
-                {
-                    "job_id": ...,
-                    "job_name": ...,
-                    "before": [...],
-                    "after": [...],
-                    "mapped": {"old": "new", ...},
-                    "dropped": ["old", ...],
-                },
-                ...
-            ],
-            "jobs_updated": N,
-            "jobs_scanned": M,
-        }
-
-    Best-effort: exceptions from loading/saving propagate to the caller so
-    tests can assert behaviour; the curator invocation site wraps this
-    call in a try/except so a failure here never breaks the curator.
-    """
-    consolidated = dict(consolidated or {})
-    pruned_set = set(pruned or [])
-    # A skill listed in both wins as "consolidated" — it has a target,
-    # which is the more useful of the two outcomes.
-    pruned_set -= set(consolidated.keys())
-
-    if not consolidated and not pruned_set:
-        return {"rewrites": [], "jobs_updated": 0, "jobs_scanned": 0}
-
-    with _jobs_file_lock:
-        jobs = load_jobs()
-        rewrites: List[Dict[str, Any]] = []
-        changed = False
-
-        for job in jobs:
-            skills_before = _normalize_skill_list(job.get("skill"), job.get("skills"))
-            if not skills_before:
-                continue
-
-            mapped: Dict[str, str] = {}
-            dropped: List[str] = []
-            new_skills: List[str] = []
-
-            for name in skills_before:
-                if name in consolidated:
-                    target = consolidated[name]
-                    mapped[name] = target
-                    if target and target not in new_skills:
-                        new_skills.append(target)
-                elif name in pruned_set:
-                    dropped.append(name)
-                elif name not in new_skills:
-                    new_skills.append(name)
-
-            if not mapped and not dropped:
-                continue
-
-            job["skills"] = new_skills
-            job["skill"] = new_skills[0] if new_skills else None
-            changed = True
-
-            rewrites.append({
-                "job_id": job.get("id"),
-                "job_name": job.get("name") or job.get("id"),
-                "before": list(skills_before),
-                "after": list(new_skills),
-                "mapped": mapped,
-                "dropped": dropped,
-            })
-
-        if changed:
-            save_jobs(jobs)
-            logger.info(
-                "Curator rewrote skill references in %d cron job(s)", len(rewrites)
-            )
-
-        return {
-            "rewrites": rewrites,
-            "jobs_updated": len(rewrites),
-            "jobs_scanned": len(jobs),
-        }
+                    # One-shot: mark as attempted so it won't re-fire after a
+                    # gateway restart.  The marker is cleared by mark_job_run
+                    # on successful completion.
+                    if kind == "once" and not job.get("attempted_at"):
+                        job["attempted_at"] = _hermes_now().isoformat()
+                        save_jobs(jobs)
+                        return True

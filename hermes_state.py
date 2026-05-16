@@ -938,6 +938,54 @@ class SessionDB:
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    def get_cost_summary(self, since_hours: Optional[int] = 24) -> dict:
+        """Return aggregated token/cost data for sessions.
+
+        Only counts sessions with api_call_count > 0 (real usage).
+        When *since_hours* is None or 0, aggregates ALL sessions (cumulative).
+        Returns dict with keys: session_count, total_input_tokens, total_output_tokens,
+        total_cache_read_tokens, total_cache_write_tokens, total_reasoning_tokens,
+        total_estimated_cost_usd.
+        """
+        with self._lock:
+            if since_hours is None or since_hours <= 0:
+                cursor = self._conn.execute("""
+                    SELECT
+                        COUNT(*) as session_count,
+                        COALESCE(SUM(input_tokens), 0) as total_input_tokens,
+                        COALESCE(SUM(output_tokens), 0) as total_output_tokens,
+                        COALESCE(SUM(cache_read_tokens), 0) as total_cache_read_tokens,
+                        COALESCE(SUM(cache_write_tokens), 0) as total_cache_write_tokens,
+                        COALESCE(SUM(reasoning_tokens), 0) as total_reasoning_tokens,
+                        COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost_usd
+                    FROM sessions
+                    WHERE api_call_count > 0
+                """)
+            else:
+                cursor = self._conn.execute("""
+                    SELECT
+                        COUNT(*) as session_count,
+                        COALESCE(SUM(input_tokens), 0) as total_input_tokens,
+                        COALESCE(SUM(output_tokens), 0) as total_output_tokens,
+                        COALESCE(SUM(cache_read_tokens), 0) as total_cache_read_tokens,
+                        COALESCE(SUM(cache_write_tokens), 0) as total_cache_write_tokens,
+                        COALESCE(SUM(reasoning_tokens), 0) as total_reasoning_tokens,
+                        COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost_usd
+                    FROM sessions
+                    WHERE started_at >= unixepoch('now', ?)
+                      AND api_call_count > 0
+                """, (f'-{since_hours} hours',))
+            row = cursor.fetchone()
+        return {
+            "session_count": row["session_count"],
+            "total_input_tokens": row["total_input_tokens"],
+            "total_output_tokens": row["total_output_tokens"],
+            "total_cache_read_tokens": row["total_cache_read_tokens"],
+            "total_cache_write_tokens": row["total_cache_write_tokens"],
+            "total_reasoning_tokens": row["total_reasoning_tokens"],
+            "total_estimated_cost_usd": round(row["total_estimated_cost_usd"], 6),
+        }
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
