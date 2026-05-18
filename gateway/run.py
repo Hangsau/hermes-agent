@@ -409,6 +409,60 @@ def _read_workspace_context() -> Optional[str]:
     return "\n\n".join(parts)
 
 
+def _snapshot_environment(agent_name: str = "hestia") -> None:
+    """Write current environment snapshot to agent-state.json.
+
+    Called at session init to keep the shared state fresh.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    state_path = Path.home() / ".hermes" / "agent-state.json"
+    try:
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+        else:
+            state = {}
+    except Exception:
+        state = {}
+
+    cwd = os.getcwd()
+    venv = os.environ.get("VIRTUAL_ENV", "none")
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "+08:00")
+
+    # Gather recent errors from agent log
+    errors = []
+    log_path = Path.home() / ".hermes" / "logs" / "errors.log"
+    if log_path.exists():
+        try:
+            lines = log_path.read_text().splitlines()
+            for line in reversed(lines[-200:]):
+                if " ERROR " in line or " CRITICAL " in line:
+                    errors.append(line.strip())
+        except Exception:
+            pass
+
+    agent_state = state.get(agent_name, {})
+    agent_state.update({
+        "last_seen": now,
+        "cwd": cwd,
+        "venv": venv,
+        "known_issues": errors[:3],
+        "phase": "active",
+    })
+    state[agent_name] = agent_state
+    state["_meta"] = {
+        "last_updated_by": agent_name,
+        "last_updated_at": now,
+        "version": state.get("_meta", {}).get("version", 1),
+    }
+
+    try:
+        state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+    except Exception:
+        pass  # non-blocking — don't break session init
+
+
 # Mark this process as a gateway so cli.py's module-level load_cli_config()
 # knows not to clobber TERMINAL_CWD if lazily imported.
 os.environ["_HERMES_GATEWAY"] = "1"
@@ -7345,6 +7399,8 @@ class GatewayRunner:
             ws_ctx = _read_workspace_context()
             if ws_ctx:
                 context_prompt += "\n\n---\nWORKSPACE CONTEXT (from ~/.hermes/workspace/)\n---\n\n" + ws_ctx
+            # WS-005 Phase 2: snapshot environment to shared state
+            _snapshot_environment()
         
         # WS-005 Phase 1: inject workspace context on new sessions
         if _is_new_session:
