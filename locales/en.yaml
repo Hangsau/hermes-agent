@@ -29,6 +29,7 @@ gateway:
   # Messenger replies to slash commands and implicit state changes.
   approval_expired: "⚠️ Approval expired (agent is no longer waiting). Ask the agent to try again."
   draining:         "⏳ Draining {count} active agent(s) before restart..."
+  restart_refused:  "⚠️ Cannot restart: {count} active agent(s) still running. Please wait for them to finish or restart externally (systemctl/SSH)."
   goal_cleared:     "✓ Goal cleared."
   no_active_goal:   "No active goal."
   config_read_failed: "⚠️ Could not read config.yaml: {error}"
