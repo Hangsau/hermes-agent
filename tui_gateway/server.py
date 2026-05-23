@@ -1276,6 +1276,34 @@ def _sync_session_key_after_compress(
             pass
 
 
+def _rewrite_session_history(session: dict, messages: list | None = None) -> None:
+    """Persist an in-memory history rewrite and realign agent transcript state."""
+
+    if messages is None:
+        with session["history_lock"]:
+            messages = list(session.get("history", []))
+    else:
+        messages = list(messages)
+
+    session_key = str(session.get("session_key", "") or "")
+    db = _get_db()
+    if db is not None and session_key:
+        try:
+            db.replace_messages(session_key, messages)
+        except Exception:
+            logger.debug(
+                "Failed to rewrite TUI transcript for %s", session_key, exc_info=True
+            )
+
+    agent = session.get("agent")
+    if agent is None:
+        return
+    if hasattr(agent, "_session_messages"):
+        agent._session_messages = list(messages)
+    if hasattr(agent, "_last_flushed_db_idx"):
+        agent._last_flushed_db_idx = len(messages)
+
+
 def _get_usage(agent) -> dict:
     g = lambda k, fb=None: getattr(agent, k, 0) or (getattr(agent, fb, 0) if fb else 0)
     usage = {
@@ -3263,6 +3291,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         if current_version == history_version:
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
+                            _rewrite_session_history(session, result["messages"])
                         else:
                             # History mutated externally during the turn
                             # (undo/compress/retry/rollback now guard on
