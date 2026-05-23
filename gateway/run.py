@@ -12767,13 +12767,21 @@ class GatewayRunner:
         return t("gateway.deny.denied_singular")
 
     async def _handle_otp_command(self, event: MessageEvent) -> str:
-        """Handle /otp command — verify OTP code for a pending high-risk operation.
+        """Handle /otp command — verify OTP code and unblock pending dangerous command.
 
         Usage: /otp <token> <code>
         Example: /otp abc123 DEF456
+
+        Flow:
+        1. Verify OTP via otp_gate.verify(token, code)
+        2. If valid: call resolve_gateway_approval() to unblock agent thread
+           (agent was blocked waiting for approval after OTP generation)
+        3. Resume typing indicator so user sees agent resume
         """
         source = event.source
+        session_key = self._session_key_for_source(source)
         args = event.get_command_args().strip().split()
+
         if len(args) < 2:
             return "Usage: /otp <token> <code>\n例：/otp abc123 DEF456"
 
@@ -12789,14 +12797,27 @@ class GatewayRunner:
             logger.error("Failed to import otp_gate: %s", e)
             return "❌ OTP module unavailable"
 
-        if otp_gate.verify(token, code):
-            logger.info("OTP verified for token %s", token[:8])
-            _adapter = self.adapters.get(source.platform)
-            if _adapter:
-                _adapter.resume_typing_for_chat(source.chat_id)
-            return "✅ OTP verified."
-        else:
+        # Step 1: verify OTP code
+        if not otp_gate.verify(token, code):
             return "❌ Invalid OTP or expired"
+
+        # Step 2: unblock agent thread via gateway approval queue
+        from tools.approval import resolve_gateway_approval, has_blocking_approval
+
+        # resolve_gateway_approval with "once" = treat as one-time approval
+        count = resolve_gateway_approval(session_key, "once", resolve_all=False)
+
+        logger.info("OTP verified for token %s, resolved %d approval(s)", token[:8], count)
+
+        # Step 3: resume typing indicator
+        _adapter = self.adapters.get(source.platform)
+        if _adapter:
+            _adapter.resume_typing_for_chat(source.chat_id)
+
+        if count > 0:
+            return "✅ OTP verified — command approved."
+        else:
+            return "✅ OTP verified (no pending approval to unblock)."
 
     # Platforms where /update is allowed.  ACP, API server, and webhooks are
     # programmatic interfaces that should not trigger system updates.

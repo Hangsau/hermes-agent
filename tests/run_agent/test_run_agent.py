@@ -985,9 +985,9 @@ class TestBuildSystemPrompt:
         assert MEMORY_GUIDANCE not in prompt
 
     def test_includes_datetime(self, agent):
+        """Timestamp moved to presentation layer; no longer in system prompt."""
         prompt = agent._build_system_prompt()
-        # Should contain current date info like "Conversation started:"
-        assert "Conversation started:" in prompt
+        assert "Conversation started:" not in prompt
 
     def test_includes_nous_subscription_prompt(self, agent, monkeypatch):
         monkeypatch.setattr(run_agent, "build_nous_subscription_prompt", lambda tool_names: "NOUS SUBSCRIPTION BLOCK")

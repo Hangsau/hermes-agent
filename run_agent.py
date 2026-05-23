@@ -6244,17 +6244,6 @@ class AIAgent:
             except Exception:
                 pass
 
-        from hermes_time import now as _hermes_now
-        now = _hermes_now()
-        timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
-        if self.pass_session_id and self.session_id:
-            timestamp_line += f"\nSession ID: {self.session_id}"
-        if self.model:
-            timestamp_line += f"\nModel: {self.model}"
-        if self.provider:
-            timestamp_line += f"\nProvider: {self.provider}"
-        volatile_parts.append(timestamp_line)
-
         return {
             "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
             "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),

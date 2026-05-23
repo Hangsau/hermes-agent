@@ -810,6 +810,88 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
+def get_due_jobs() -> List[Dict[str, Any]]:
+    """Return jobs whose next_run_at is in the past (or recoverable).
+
+    For recurring jobs past their dynamic grace window, fast-forwards
+    next_run_at and skips them.  For one-shot jobs, applies a 120-second
+    grace window for recovery.
+
+    Returns list of job dicts that are due to run.
+    """
+    now = _hermes_now()
+    due: List[Dict[str, Any]] = []
+
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        dirty = False
+
+        for job in jobs:
+            if not job.get("enabled", True):
+                continue
+
+            schedule = job.get("schedule", {})
+            kind = schedule.get("kind")
+            next_run_at = job.get("next_run_at")
+
+            # One-shot that was already attempted but not yet marked complete:
+            # it's in-flight — don't double-fire.
+            if job.get("attempted_at") and kind == "once":
+                continue
+
+            if next_run_at:
+                next_dt = _ensure_aware(datetime.fromisoformat(next_run_at))
+
+                if next_dt <= now:
+                    # Past due — check if within grace window
+                    grace = _compute_grace_seconds(schedule)
+                    if next_dt >= now - timedelta(seconds=grace):
+                        due.append(job)
+                    elif kind in ("cron", "interval"):
+                        # Recurring job past grace → fast-forward
+                        new_next = compute_next_run(schedule, next_run_at)
+                        if new_next:
+                            job["next_run_at"] = new_next
+                            dirty = True
+            else:
+                # No next_run_at — try recovery
+                if kind == "once":
+                    recovered = _recoverable_oneshot_run_at(
+                        schedule, now, last_run_at=job.get("last_run_at")
+                    )
+                    if recovered:
+                        job["next_run_at"] = recovered
+                        dirty = True
+                        due.append(job)
+                elif kind in ("cron", "interval"):
+                    new_next = compute_next_run(schedule)
+                    if new_next:
+                        job["next_run_at"] = new_next
+                        dirty = True
+                        next_dt = _ensure_aware(datetime.fromisoformat(new_next))
+                        if next_dt <= now:
+                            due.append(job)
+
+        if dirty:
+            save_jobs(jobs)
+
+    return due
+
+
+def save_job_output(job_id: str, output: str) -> Path:
+    """Save cron job output to the job's output directory.
+
+    Returns the path to the saved file.
+    """
+    ensure_dirs()
+    timestamp = _hermes_now().strftime("%Y-%m-%dT%H%M%S")
+    job_output_dir = OUTPUT_DIR / job_id
+    job_output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = job_output_dir / f"{timestamp}.md"
+    output_file.write_text(output, encoding="utf-8")
+    return output_file
+
+
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                  delivery_error: Optional[str] = None):
     """
