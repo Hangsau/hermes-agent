@@ -1173,14 +1173,15 @@ def _preserve_queued_followup_history_offset(
 def _read_workspace_context() -> Optional[str]:
     """Read workspace state for new-session context injection.
 
-    Returns a compact markdown block combining:
-    - session_state.md (active project, blockers, next action)
-    - workspace_inject.py --brief (active project overview)
+    Returns a compact markdown block combining (in priority order):
+    - session_state.md (Layer 1 — active project, blockers, next action)
+    - workspace_inject.py --brief (Layer 2 — active project overview)
 
-    Returns None when neither source is available, so callers can
+    Returns None when no source is available, so callers can
     silently skip injection without breaking session startup.
     """
-    ws_dir = Path.home() / ".hermes" / "workspace"
+    hermes_dir = Path.home() / ".hermes"
+    ws_dir = hermes_dir / "workspace"
     parts: list[str] = []
 
     # Layer 1 — session_state.md: what we were doing, blockers, next action
@@ -6712,6 +6713,9 @@ class GatewayRunner:
 
         if canonical == "deny":
             return await self._handle_deny_command(event)
+
+        if canonical == "otp":
+            return await self._handle_otp_command(event)
 
         if canonical == "update":
             return await self._handle_update_command(event)
@@ -12761,6 +12765,38 @@ class GatewayRunner:
         if count > 1:
             return t("gateway.deny.denied_plural", count=count)
         return t("gateway.deny.denied_singular")
+
+    async def _handle_otp_command(self, event: MessageEvent) -> str:
+        """Handle /otp command — verify OTP code for a pending high-risk operation.
+
+        Usage: /otp <token> <code>
+        Example: /otp abc123 DEF456
+        """
+        source = event.source
+        args = event.get_command_args().strip().split()
+        if len(args) < 2:
+            return "Usage: /otp <token> <code>\n例：/otp abc123 DEF456"
+
+        token = args[0]
+        code = args[1].upper()
+
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path.home() / ".hermes" / "scripts"))
+        try:
+            import otp_gate
+        except Exception as e:
+            logger.error("Failed to import otp_gate: %s", e)
+            return "❌ OTP module unavailable"
+
+        if otp_gate.verify(token, code):
+            logger.info("OTP verified for token %s", token[:8])
+            _adapter = self.adapters.get(source.platform)
+            if _adapter:
+                _adapter.resume_typing_for_chat(source.chat_id)
+            return "✅ OTP verified."
+        else:
+            return "❌ Invalid OTP or expired"
 
     # Platforms where /update is allowed.  ACP, API server, and webhooks are
     # programmatic interfaces that should not trigger system updates.
